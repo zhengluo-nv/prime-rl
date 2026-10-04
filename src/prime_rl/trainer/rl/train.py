@@ -42,12 +42,10 @@ from prime_rl.trainer.rl.annotations import AnnotationWriter
 from prime_rl.trainer.model import (
     forward,
     get_full_offload_dtype_policy,
-    get_expert_load_stats,
-    get_global_moe_stats,
-    is_tt_moe_model,
     setup_model,
     setup_processor,
 )
+from prime_rl.trainer.moe_runtime import get_expert_load_stats, get_global_moe_stats, is_tt_moe_model
 from prime_rl.trainer.parallel_dims import get_parallel_dims, resolve_ep
 from prime_rl.trainer.perf import get_perf_counter
 from prime_rl.trainer.utils import (

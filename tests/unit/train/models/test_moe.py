@@ -4,7 +4,6 @@ import torch.nn.functional as F
 
 from prime_rl.configs.trainer import ModelConfig
 from prime_rl.trainer.distributed.token_dispatcher import LocalTokenDispatcher
-from prime_rl.trainer.model import compute_expert_load_stats, is_tt_moe_model
 from prime_rl.trainer.models.deepseek_v4.moe import DeepseekV4Experts
 from prime_rl.trainer.models.fusions import fuse_gate_up_projections
 from prime_rl.trainer.models.layers.activations import ActivationDispatch
@@ -21,7 +20,7 @@ from prime_rl.trainer.models.qwen3_5 import (
     Qwen3_5MoeTextConfig,
     Qwen3_5TextConfig,
 )
-from prime_rl.trainer.moe_runtime import configure_moe_runtime
+from prime_rl.trainer.moe_runtime import compute_expert_load_stats, configure_moe_runtime, is_tt_moe_model
 from prime_rl.trainer.parallel_dims import ParallelDims
 
 

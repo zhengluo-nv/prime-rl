@@ -11,7 +11,6 @@ os.environ.setdefault("USE_HUB_KERNELS", "NO")
 
 import torch
 import torch._dynamo
-import torch.distributed as dist
 import torch.nn as nn
 from huggingface_hub import snapshot_download
 from jaxtyping import Int
@@ -56,11 +55,17 @@ from prime_rl.trainer.models.fusions import (
 from prime_rl.trainer.models.glm_moe_dsa.sparse_mla_attention import Indexer
 from prime_rl.trainer.models.layers.fp8_linear import replace_linear_with_fp8_blockwise_linear
 from prime_rl.trainer.models.layers.lm_head import inject_prime_lm_head
-from prime_rl.trainer.models.layers.moe import MoE, TokenChoiceTopKRouter
+from prime_rl.trainer.models.layers.moe import MoE
 from prime_rl.trainer.models.layers.mxfp8_linear import replace_linear_with_mxfp8_linear
 from prime_rl.trainer.models.qwen3_8_flash_next.indexer import SparseAttentionIndexer
 from prime_rl.trainer.models.qwen3_8_flash_next.ngram_embedding import NGramEmbedding
-from prime_rl.trainer.moe_runtime import configure_moe_runtime
+from prime_rl.trainer.moe_runtime import (
+    apply_force_balanced_routing,
+    apply_fp32_moe_router,
+    configure_moe_runtime,
+    freeze_moe_router,
+    iter_moe_blocks,
+)
 from prime_rl.trainer.parallel_dims import ParallelDims
 from prime_rl.trainer.world import get_world
 from prime_rl.utils.logger import get_logger
@@ -125,48 +130,6 @@ def freeze_vision_encoder(model: nn.Module, override_attr: str | None = None) ->
     logger.info(f"Froze {num_frozen} parameters in vision encoder")
 
 
-def freeze_moe_router(model: nn.Module) -> None:
-    """Freeze MoE router parameters to maintain stable routing during training."""
-    logger = get_logger()
-    language_model = get_language_model(model)
-    num_frozen = 0
-
-    for layer in language_model.layers:
-        mlp = layer.mlp if hasattr(layer, "mlp") else layer.feed_forward if hasattr(layer, "feed_forward") else None
-        if isinstance(mlp, MoE):
-            for param in mlp.router.parameters():
-                param.requires_grad = False
-                num_frozen += 1
-
-    if num_frozen == 0:
-        raise ValueError("No MoE router parameters found to freeze. Is this a MoE model?")
-
-    logger.info(f"Froze {num_frozen} MoE router parameters")
-
-
-def apply_fp32_moe_router(model: nn.Module) -> None:
-    """Cast MoE router gates to fp32 so routing runs in fp32 in forward and backward.
-
-    The FSDP bf16 cast exemption is applied separately in `setup_fsdp`.
-    """
-    logger = get_logger()
-    language_model = get_language_model(model)
-    num_routers = 0
-
-    for layer in language_model.layers:
-        mlp = layer.mlp if hasattr(layer, "mlp") else layer.feed_forward if hasattr(layer, "feed_forward") else None
-        if isinstance(mlp, MoE):
-            mlp.router.to(torch.float32)
-            if isinstance(mlp.router, TokenChoiceTopKRouter):
-                mlp.router.fp32_gate = True
-            num_routers += 1
-
-    # No-op for non-MoE models: moe_router_dtype='float32' is the default,
-    # so absence of MoE routers is the common case, not an error.
-    if num_routers > 0:
-        logger.info(f"Running {num_routers} MoE router gates in fp32")
-
-
 def get_full_offload_dtype_policy(
     model: nn.Module,
     config: ModelConfig,
@@ -177,13 +140,10 @@ def get_full_offload_dtype_policy(
     if config.moe_router_dtype != "float32":
         return policy
 
-    language_model = get_language_model(model)
-    for layer in language_model.layers:
-        mlp = layer.mlp if hasattr(layer, "mlp") else layer.feed_forward if hasattr(layer, "feed_forward") else None
-        if isinstance(mlp, MoE):
-            for param in mlp.router.parameters():
-                if param.is_floating_point():
-                    policy[id(param)] = (torch.float32, torch.float32)
+    for moe in iter_moe_blocks(model):
+        for param in moe.router.parameters():
+            if param.is_floating_point():
+                policy[id(param)] = (torch.float32, torch.float32)
     return policy
 
 
@@ -210,133 +170,6 @@ def freeze_sparse_indexer(model: nn.Module) -> None:
 
     if num_frozen > 0:
         logger.info(f"Froze {num_frozen} sparse indexer parameters")
-
-
-def apply_force_balanced_routing(model: nn.Module) -> None:
-    """Force MoE token-choice routers into round-robin assignment for fake-data smoke tests."""
-    logger = get_logger()
-    language_model = get_language_model(model)
-    num_routers = 0
-
-    for layer in language_model.layers:
-        mlp = layer.mlp if hasattr(layer, "mlp") else layer.feed_forward if hasattr(layer, "feed_forward") else None
-        if isinstance(mlp, MoE):
-            mlp.router.force_balanced = True
-            num_routers += 1
-
-    if num_routers == 0:
-        raise ValueError("No MoE routers found to force-balance. Is this a MoE model?")
-
-    logger.warning(
-        f"Forced balanced routing on {num_routers} MoE layers (debug.force_balanced_routing=True). "
-        "Expert assignment is round-robin; gradient flow through the router is broken."
-    )
-
-
-def is_tt_moe_model(model: nn.Module) -> bool:
-    config = getattr(model.config, "text_config", model.config)
-    return hasattr(config, "num_experts") or hasattr(config, "n_routed_experts")
-
-
-def get_load_balance_stats(
-    model: nn.Module,
-    group: dist.ProcessGroup | None = None,
-) -> dict[str, Tensor | None]:
-    """Compute routing stats after summing raw counts across the group, if given.
-
-    Also returns this rank's raw per-layer expert counts (`[num_moe_layers, num_experts]`) for step-level stats.
-    """
-    per_layer_max_vio = []
-    per_layer_routing_confidence = []
-    language_model = get_language_model(model)
-    block_mlps = []
-    for transformer_block in language_model.layers:
-        # This is necessary for models that have mixed dense layers
-        block_mlp = getattr(transformer_block, "mlp", None)
-        if block_mlp is not None and hasattr(block_mlp, "tokens_per_expert"):
-            block_mlps.append(block_mlp)
-    if not block_mlps:
-        return {"max_vio": None, "routing_confidence": None, "tokens_per_expert": torch.empty(0, 0)}
-
-    local_tokens_per_expert = torch.stack([block_mlp.tokens_per_expert for block_mlp in block_mlps])
-    layer_stats = [(block_mlp.tokens_per_expert, block_mlp.routing_confidence_sum) for block_mlp in block_mlps]
-    if group is not None:
-        sizes = [tokens_per_expert.numel() + 1 for tokens_per_expert, _ in layer_stats]
-        packed_stats = torch.cat(
-            [torch.cat((tokens_per_expert, confidence.reshape(1))) for tokens_per_expert, confidence in layer_stats]
-        )
-        dist.all_reduce(packed_stats, op=dist.ReduceOp.SUM, group=group)
-        layer_stats = [(stats[:-1], stats[-1]) for stats in packed_stats.split(sizes)]
-
-    for block_mlp, (tokens_per_expert, routing_confidence_sum) in zip(block_mlps, layer_stats):
-        num_routed_tokens = tokens_per_expert.sum() / block_mlp.router.top_k
-        tokens_per_expert = tokens_per_expert.sort(dim=0, descending=True).values[block_mlp.router.top_k :]
-        balanced_load = tokens_per_expert.mean()
-        max_vio = (tokens_per_expert.max() - balanced_load) / balanced_load
-        per_layer_max_vio.append(max_vio.detach())
-
-        routing_confidence = routing_confidence_sum / num_routed_tokens
-        per_layer_routing_confidence.append(routing_confidence.detach())
-
-        block_mlp.tokens_per_expert.zero_()
-        block_mlp.routing_confidence_sum.zero_()
-    return {
-        "max_vio": torch.stack(per_layer_max_vio),
-        "routing_confidence": torch.stack(per_layer_routing_confidence),
-        "tokens_per_expert": local_tokens_per_expert,
-    }
-
-
-def get_global_moe_stats(
-    model: nn.Module,
-    ep_group: dist.ProcessGroup | None,
-    dp_cp_group: dist.ProcessGroup,
-) -> tuple[dict[str, Tensor], Tensor]:
-    """Reduce one microstep's routing stats across EP, then DP and CP ranks.
-
-    Also returns this rank's unreduced per-layer expert counts, to accumulate over the step for `get_expert_load_stats`.
-    """
-    stats = {}
-    load_balance_stats = get_load_balance_stats(model, group=ep_group)
-    tokens_per_expert = load_balance_stats.pop("tokens_per_expert")
-    for name, values in load_balance_stats.items():
-        if values is None:
-            continue
-        value = values.max() if name == "max_vio" else values.mean()
-        if name == "max_vio":
-            dist.all_reduce(value, op=dist.ReduceOp.MAX, group=dp_cp_group)
-        else:
-            dist.all_reduce(value, op=dist.ReduceOp.SUM, group=dp_cp_group)
-            value /= dist.get_world_size(dp_cp_group)
-        stats[name] = value.to("cpu")
-    return stats, tokens_per_expert
-
-
-def compute_expert_load_stats(tokens_per_expert: Tensor) -> dict[str, Tensor]:
-    """Per-layer expert-load balance from `[num_moe_layers, num_experts]` token counts, as mean and max over layers.
-
-    `cv` is std/mean of the expert loads, `max_mean` the busiest expert's load over the mean load, and `cold_frac`
-    the fraction of experts receiving under 0.1x the mean load (the MiMo-V2.6 definition).
-    """
-    mean_load = tokens_per_expert.mean(dim=1)
-    per_layer = {
-        "cv": tokens_per_expert.std(dim=1, correction=0) / mean_load,
-        "max_mean": tokens_per_expert.amax(dim=1) / mean_load,
-        "cold_frac": (tokens_per_expert < 0.1 * mean_load[:, None]).float().mean(dim=1),
-    }
-    stats = {}
-    for name, values in per_layer.items():
-        stats[f"expert_load/{name}/mean"] = values.mean()
-        stats[f"expert_load/{name}/max"] = values.max()
-    return stats
-
-
-def get_expert_load_stats(tokens_per_expert: Tensor, group: dist.ProcessGroup) -> dict[str, float]:
-    """Sum a step's per-layer expert counts across the group (every rank routes distinct tokens) and compute load stats."""
-    if tokens_per_expert.numel() == 0:  # MoE model without prime-rl MoE layers (HF impl)
-        return {}
-    dist.all_reduce(tokens_per_expert, op=dist.ReduceOp.SUM, group=group)
-    return {name: value.item() for name, value in compute_expert_load_stats(tokens_per_expert).items()}
 
 
 def get_model(
