@@ -330,6 +330,7 @@ class TrainSink:
             del self.pending_batch[trace_id]
 
         if not self.config.constant_trainer_batch_size:
+
             def prune_selected() -> dict[str, list[TrainingSample]]:
                 pruned = {
                     trace_id: [sample for sample in samples if _prune_zero_advantages(sample)]
