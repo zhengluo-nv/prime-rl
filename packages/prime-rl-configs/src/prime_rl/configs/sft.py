@@ -13,7 +13,6 @@ from prime_rl.configs.inference import InferenceConfig
 from prime_rl.configs.inference import WeightBroadcastConfig as InferenceWeightBroadcastConfig
 from prime_rl.configs.monitors import TrainMonitorsConfig
 from prime_rl.configs.shared import (
-    EnvVars,
     FileSystemWeightBroadcastConfig,
     NCCLWeightBroadcastConfig,
     ResumeConfig,
@@ -207,9 +206,6 @@ class SFTConfig(BaseTrainerConfig):
     # Standard L2 regularization for supervised training.
     auto_weight_decay = 0.01
 
-    env_vars: EnvVars = {}
-    """Extra environment variables for the SFT trainer process(es). Merged on top of the launcher defaults."""
-
     renderer: RendererConfig = AutoRendererConfig()
     """Renderer config. Defaults to auto-selecting from the tokenizer model name."""
 
@@ -267,9 +263,6 @@ class SFTConfig(BaseTrainerConfig):
         if self.monitors.prime is not None and self.monitors.prime.name is None:
             self.monitors.prime.name = self.run.name
         return self
-
-    max_steps: int | None = None
-    """Maximum training steps. If None, runs indefinitely."""
 
     deployment: SFTDeploymentConfig = SingleNodeDeploymentConfig()
 
