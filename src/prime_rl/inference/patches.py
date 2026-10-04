@@ -21,6 +21,7 @@ def apply_shared_vllm_patches():
     monkey_patch_return_routed_experts_with_kv_connectors()
     monkey_patch_clamp_kv_offload_loads_for_routed_experts()
     monkey_patch_routed_experts_cut_stale_prefix_hits()
+    monkey_patch_routed_experts_skip_host_kv_groups()
     monkey_patch_kv_xfer_finished_tolerate_freed()
     monkey_patch_online_fp8_parameter_cast()
     monkey_patch_deepseek_v4_allowed_layer_types()
@@ -249,7 +250,11 @@ def monkey_patch_minimax_m2_think_end_passthrough():
 # instance's prompt rows are stale, but the router replaces them with the prefill rows. Offload
 # connectors: their loads are clamped by `monkey_patch_clamp_kv_offload_loads_for_routed_experts`, and
 # later local hits on loaded blocks are cut by `monkey_patch_routed_experts_cut_stale_prefix_hits`.
-ROUTED_EXPERTS_KV_CONNECTORS = frozenset({"NixlConnector", "OffloadingConnector", "MooncakeStoreConnector"})
+# HiSparse: never reports external hits; `monkey_patch_routed_experts_skip_host_kv_groups` keys
+# routing by a GPU cache group.
+ROUTED_EXPERTS_KV_CONNECTORS = frozenset(
+    {"NixlConnector", "OffloadingConnector", "MooncakeStoreConnector", "HiSparseConnector"}
+)
 
 
 def monkey_patch_return_routed_experts_with_kv_connectors():
@@ -452,6 +457,34 @@ def monkey_patch_routed_experts_cut_stale_prefix_hits():
     _get_local_prefix_cache_hit._prime_rl_routed_experts_cut = True
     Scheduler.__init__ = __init__
     Scheduler._get_local_prefix_cache_hit = _get_local_prefix_cache_hit
+
+
+def get_routed_experts_attn_gid_skipping_host_groups(kv_cache_config) -> int:
+    """vLLM's ``get_routed_experts_attn_gid``, skipping host-resident KV cache groups."""
+    from vllm.v1.kv_cache_interface import is_full_attention_spec
+
+    for gid, group in enumerate(kv_cache_config.kv_cache_groups):
+        if not group.host_resident and is_full_attention_spec(group.kv_cache_spec):
+            return gid
+    raise ValueError("Routed-experts capture requires a GPU full-attention KV cache group.")
+
+
+def monkey_patch_routed_experts_skip_host_kv_groups():
+    """Key vLLM's routed-experts slot buffer by a GPU KV cache group under HiSparse.
+
+    vLLM picks the first full-attention group, which under HiSparse is the host-resident sparse-MLA
+    source group. Its block ids index the host pool, which is usually larger than the GPU pool the
+    buffer is sized for: on a decode instance the slot writes go out of bounds and crash the engine,
+    and on an aggregated instance prompt rows are read from the wrong slots. Skipping host-resident
+    groups selects the GPU indexer group (full-length and prefix-cacheable).
+
+    Obsolete with vllm#45635 (vLLM > 0.30.0 keys routing by block hash): there
+    ``get_routed_experts_attn_gid`` is gone and this patch becomes a silent no-op, so delete it at the
+    next vLLM bump.
+    """
+    from vllm.model_executor.layers.fused_moe import routed_experts_capturer
+
+    routed_experts_capturer.get_routed_experts_attn_gid = get_routed_experts_attn_gid_skipping_host_groups
 
 
 def monkey_patch_strip_routed_experts_from_chat():

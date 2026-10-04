@@ -15,6 +15,7 @@ This page covers the inference configuration and the supported features/deployme
 - [Adaptive Concurrency](#adaptive-concurrency)
 - [Advanced Configuration](#advanced-configuration)
     - [KV Cache Offload](#kv-cache-offload)
+    - [HiSparse](#hisparse)
     - [Optimized P/D disaggregation deployment](#optimized-pd-disaggregation-deployment)
     - [Other vLLM features](#other-vllm-features)
     - [Router Replay](#router-replay)
@@ -247,6 +248,18 @@ path = "/scratch/kv"
 
 For `native`, `cpu.num_bytes` is the aggregate CPU KV pool for the instance (vLLM shards it across workers). For `mooncake`, `cpu.num_bytes` is the DRAM each node contributes to the shared pool (so the total pool ≈ `num_bytes × #inference-nodes`); the store uses RDMA, so it requires an RDMA-capable fabric. Enabling offload automatically enables prefix caching.
 
+### HiSparse
+
+> **Experimental.** Off by default and not used by any example config. Validated so far: P/D with HiSparse on decode, router replay and sampling replay on, on a small random DSA model (statistical checks only). Not validated yet: a real GLM-5.x long-prompt (40k+) quality A/B, aggregated HiSparse against the trainer forward pass, and preemption or failed KV loads with HiSparse.
+
+HiSparse (vLLM, DSA sparse-MLA models such as GLM-5.x) keeps the sparse-MLA KV in a pinned host pool. Decode attention reads per-request GPU buffers that hold the indexer top-k rows. This frees GPU memory for many more concurrent decode sequences.
+
+```toml
+[inference.hisparse]
+host_pool_gib = 160   # pinned host RAM per GPU worker
+```
+
+prime-rl adds vLLM's `HiSparseConnector` to the KV transfer config. Under disaggregated P/D it applies to decode instances only: the launcher writes one engine config per role (`inference-prefill.json`, `inference-decode.json`) and drops HiSparse from the prefill one. Under P/D it cannot be combined with `inference.kv_cache_offload` yet, because offload would also run on decode. Budget decode-node RAM as `GPUs per node × host_pool_gib`. vLLM checks HiSparse's requirements at startup: the V2 model runner (vLLM selects it), no pipeline or decode context parallelism, and a model with `index_topk`. Size decode `max_num_seqs` explicitly (e.g. 96 per rank): the GPU buffers scale with it.
 
 ### Optimized P/D disaggregation deployment
 

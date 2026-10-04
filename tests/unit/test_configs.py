@@ -1031,6 +1031,17 @@ def test_combined_replay_uses_v2_runner(monkeypatch, deployment):
     assert os.environ["VLLM_USE_V2_MODEL_RUNNER"] == "1"
 
 
+def test_hisparse_decode_only_under_pd():
+    config = InferenceConfig(deployment={"type": "disaggregated"}, slurm={}, hisparse={"host_pool_gib": 160})
+    prefill = config.for_pd_role("prefill").build_kv_transfer_config()
+    decode = config.for_pd_role("decode").build_kv_transfer_config()
+    assert prefill["kv_connector"] == "NixlConnector"
+    assert [c["kv_connector"] for c in decode["kv_connector_extra_config"]["connectors"]] == [
+        "NixlConnector",
+        "HiSparseConnector",
+    ]
+
+
 CUSTOM_RENDERER_SOURCE = """
 from typing import Literal
 

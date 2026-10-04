@@ -57,6 +57,18 @@ def write_config(
     return config_path
 
 
+def write_pd_configs(config: InferenceConfig, output_dir: Path) -> None:
+    """Write one engine config per P/D role (``inference-{role}.json``); the sbatch picks it by ``$ROLE``."""
+    if config.deployment.type != "disaggregated":
+        return
+    for role in ("prefill", "decode"):
+        role_config = dump_resolved_config(
+            config.for_pd_role(role), exclude={"deployment", "slurm", "output_dir", "dry_run"}
+        )
+        role_config["router"] = None
+        (output_dir / f"inference-{role}.json").write_text(json.dumps(role_config, indent=2))
+
+
 def write_slurm_script(config: InferenceConfig, config_path: Path, log_dir: Path, script_path: Path) -> None:
     """Write the SLURM script to disk."""
     from jinja2 import Environment, FileSystemLoader
@@ -87,7 +99,6 @@ def write_slurm_script(config: InferenceConfig, config_path: Path, log_dir: Path
         router=config.router,
         router_port=config.server.port,
         is_disaggregated=is_disaggregated,
-        kv_offload=offload is not None,
         kv_offload_mooncake=is_mooncake,
         kv_offload_cpu_bytes=int(offload.cpu.num_bytes) if is_mooncake else 0,
         kv_offload_disk_path=str(offload.disk.path) if (is_mooncake and offload.disk is not None) else "",
@@ -140,6 +151,7 @@ def inference_slurm(config: InferenceConfig):
     is_multi_node = config.deployment.type in ("multi_node", "disaggregated")
     exclude = {"deployment", "slurm", "dry_run"} if is_multi_node else {"slurm", "dry_run"}
     config_path = write_config(config, config_dir, exclude=exclude, engine_only=is_multi_node)
+    write_pd_configs(config, config_dir)
     logger.info(f"Wrote config to {config_path}")
 
     script_path = get_launcher_dir(config.output_dir) / INFERENCE_SBATCH

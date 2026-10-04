@@ -288,6 +288,13 @@ KVCacheOffloadConfig: TypeAlias = Annotated[
 ]
 
 
+class HiSparseConfig(BaseConfig):
+    """vLLM HiSparse for DSA sparse-MLA models (e.g. GLM-5.x): the sparse-MLA KV lives in a pinned host pool and decode attention reads per-request GPU buffers of the indexer top-k rows."""
+
+    host_pool_gib: float = Field(..., gt=0)
+    """Pinned host pool per GPU worker, in GiB (``HiSparseConnector`` ``host_pool_gib``). Budget ``GPUs per node × host_pool_gib`` against node RAM."""
+
+
 # Known llm-d EPP scorer plugins (used to guard the ``scorers`` map against typos).
 KNOWN_SCORERS = frozenset(
     {
@@ -466,6 +473,9 @@ class InferenceConfig(BaseConfig):
     kv_cache_offload: KVCacheOffloadConfig | None = None
     """KV cache offload for inference workers, as composable CPU/disk tiers. Discriminated on ``type``: ``native`` (vLLM ``OffloadingConnector``/``TieringOffloadingSpec``, self-contained) or ``mooncake`` (per-node Mooncake distributed store). Disaggregated P/D combines the chosen connector with NIXL through ``MultiConnector``."""
 
+    hisparse: HiSparseConfig | None = None
+    """Enable vLLM HiSparse (experimental). Under disaggregated P/D it applies to decode instances only and cannot be combined with ``kv_cache_offload``. vLLM checks its requirements at startup (a DSA model, the V2 model runner, no pipeline or decode context parallelism)."""
+
     use_pd_kv_transfer: bool = False
     """Auto-set for disaggregated P/D: emit the NIXL transfer connector. Persisted into the per-node config (which drops ``deployment``) so the connector is still built per worker. Not meant to be set by hand."""
 
@@ -505,6 +515,27 @@ class InferenceConfig(BaseConfig):
                 "The llm-d router backend does not support routed-expert return "
                 "(enable_return_routed_experts): it breaks P/D and is unverified for multi-node. "
                 "Use router type 'vllm-router' for routed-expert runs."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_hisparse(self):
+        """vLLM itself checks HiSparse's requirements (V2 runner, no PP/DCP, a DSA model) at startup."""
+        if self.hisparse is None:
+            return self
+        disaggregated = self.deployment.type == "disaggregated"
+        if disaggregated and self.kv_cache_offload is not None:
+            raise ValueError(
+                "HiSparse with kv_cache_offload is not supported under disaggregated P/D: both would run on "
+                "decode, which is unvalidated and competes for decode-node host RAM. Use one of them until offload "
+                "can be configured per role."
+            )
+        explicit = [(self.vllm.model_extra or {}).get("kv_transfer_config")]
+        if disaggregated:
+            explicit.append(self.deployment.decode_vllm_overrides.get("kv_transfer_config"))
+        if any(config is not None and "HiSparseConnector" not in str(config) for config in explicit):
+            raise ValueError(
+                "inference.hisparse is set, but an explicit kv_transfer_config does not contain HiSparseConnector."
             )
         return self
 
@@ -561,12 +592,20 @@ class InferenceConfig(BaseConfig):
                 self.slurm.template_path = templates_dir / "inference.sbatch.j2"
         return self
 
-    def build_kv_transfer_config(self) -> dict[str, Any] | None:
-        """Build the single vLLM ``kv_transfer_config`` from the transfer + offload connectors.
+    def for_pd_role(self, role: Literal["prefill", "decode"]) -> "InferenceConfig":
+        """Engine config for one role of a disaggregated deployment. HiSparse runs on decode only."""
+        assert self.deployment.type == "disaggregated"
+        config = self.model_copy(deep=True)
+        if role == "prefill":
+            config.hisparse = None
+        return config
 
-        Disaggregated P/D always uses NIXL for prefill→decode transfer. KV cache offload (if
-        configured) contributes its own connector. When both are present they are composed via
-        ``MultiConnector``. Returns None when neither applies.
+    def build_kv_transfer_config(self) -> dict[str, Any] | None:
+        """Build the single vLLM ``kv_transfer_config`` from the transfer, offload and HiSparse connectors.
+
+        Disaggregated P/D always uses NIXL for prefill→decode transfer. KV cache offload and
+        HiSparse (if configured) contribute their own connectors. Several connectors are composed
+        via ``MultiConnector``. Returns None when none applies.
         """
         connectors: list[dict[str, Any]] = []
         if self.use_pd_kv_transfer:
@@ -579,6 +618,14 @@ class InferenceConfig(BaseConfig):
             )
         if self.kv_cache_offload is not None:
             connectors.append(self.kv_cache_offload.to_connector_dict())
+        if self.hisparse is not None:
+            connectors.append(
+                {
+                    "kv_connector": "HiSparseConnector",
+                    "kv_role": "kv_both",
+                    "kv_connector_extra_config": {"host_pool_gib": self.hisparse.host_pool_gib},
+                }
+            )
 
         if not connectors:
             return None
