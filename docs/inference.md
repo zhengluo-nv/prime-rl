@@ -299,7 +299,7 @@ enable_return_routed_experts = true
 
 This however is not free, it adds a significant overhead to the HTTP requests as this payload can grow quite large. We reccomend sizing up the env server pool (`orchestrator.*.source.serve.pool`) to allow for more parallelization on the verifiers side.
 
-Currently this feature is also not supported with CPU KV cache offload, which can have negative impact on the inference throughput.
+Router replay works with `inference.kv_cache_offload` (native and Mooncake). vLLM stores routing per physical KV slot, and no connector moves routing with the KV. So prime-rl limits an offload load to the prompt tokens the client already has routing for: the blocks before `routed_experts_prompt_start`. Multi-turn rollouts keep their offload hits, because the reloaded earlier turns sit before that position. Offloaded prefixes past it (first turns, prompts shared across a group or across nodes) are recomputed. Blocks filled by a load then serve local GPU prefix hits like any other block, but their routing slots are stale. So a local hit is cut at the first loaded block that a request needs routing from (for example a first turn that hits a prefix reloaded by another rollout's later turn), and the rest is recomputed. Under P/D, decode-side loads are not limited: the router takes the prompt routing from the prefill instance, and completion routing never comes from the slots.
 
 ### Sampling Replay
 

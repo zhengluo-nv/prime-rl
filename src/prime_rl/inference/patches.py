@@ -18,7 +18,9 @@ def apply_shared_vllm_patches():
     _patch_qwen35_moe_lora_format()
     monkey_patch_nano_v3_reasoning_parser()
     monkey_patch_minimax_m2_think_end_passthrough()
-    monkey_patch_return_routed_experts_with_nixl_connector()
+    monkey_patch_return_routed_experts_with_kv_connectors()
+    monkey_patch_clamp_kv_offload_loads_for_routed_experts()
+    monkey_patch_routed_experts_cut_stale_prefix_hits()
     monkey_patch_kv_xfer_finished_tolerate_freed()
     monkey_patch_online_fp8_parameter_cast()
     monkey_patch_deepseek_v4_allowed_layer_types()
@@ -243,33 +245,45 @@ def monkey_patch_minimax_m2_think_end_passthrough():
     minimax_m2.minimax_m2_config = _patched_config
 
 
-def monkey_patch_return_routed_experts_with_nixl_connector():
+# KV connectors that keep vLLM's slot-indexed routed-experts buffer correct. NIXL: the decode
+# instance's prompt rows are stale, but the router replaces them with the prefill rows. Offload
+# connectors: their loads are clamped by `monkey_patch_clamp_kv_offload_loads_for_routed_experts`, and
+# later local hits on loaded blocks are cut by `monkey_patch_routed_experts_cut_stale_prefix_hits`.
+ROUTED_EXPERTS_KV_CONNECTORS = frozenset({"NixlConnector", "OffloadingConnector", "MooncakeStoreConnector"})
+
+
+def monkey_patch_return_routed_experts_with_kv_connectors():
     from vllm.config.vllm import VllmConfig
     from vllm.logger import init_logger
 
     logger = init_logger(__name__)
     original_post_init = VllmConfig.__post_init__
 
-    if getattr(original_post_init, "_prime_rl_allows_nixl_routed_experts", False):
+    if getattr(original_post_init, "_prime_rl_allows_routed_experts_with_kv_connectors", False):
         return
 
-    def _is_nixl_routed_experts_pd_config(config: VllmConfig) -> bool:
+    def _allows_kv_connectors(config: VllmConfig) -> bool:
         kv_transfer_config = config.kv_transfer_config
-        return (
+        if not (
             config.model_config is not None
             and config.model_config.enable_return_routed_experts
             and kv_transfer_config is not None
-            and kv_transfer_config.kv_connector == "NixlConnector"
             and kv_transfer_config.is_kv_transfer_instance
-        )
+        ):
+            return False
+        if kv_transfer_config.kv_connector == "MultiConnector":
+            children = kv_transfer_config.kv_connector_extra_config.get("connectors", [])
+            names = {child.get("kv_connector") for child in children}
+        else:
+            names = {kv_transfer_config.kv_connector}
+        return names <= ROUTED_EXPERTS_KV_CONNECTORS
 
     def _post_init(config: VllmConfig):
-        if not _is_nixl_routed_experts_pd_config(config):
+        if not _allows_kv_connectors(config):
             return original_post_init(config)
 
-        # vLLM rejects routed-expert capture with every KV connector, but our P/D path stitches
-        # prefill/decode routed experts in the router. Clearing the flag skips that check and the
-        # PP/CP checks next to it, so those two are repeated here.
+        # vLLM rejects routed-expert capture with every KV connector. Clearing the flag skips that
+        # check and the PP/CP checks next to it, so those two are repeated here.
         parallel_config = config.parallel_config
         if parallel_config.pipeline_parallel_size > 1:
             raise ValueError("--enable-return-routed-experts is incompatible with pipeline parallelism (PP > 1).")
@@ -281,9 +295,163 @@ def monkey_patch_return_routed_experts_with_nixl_connector():
         finally:
             config.model_config.enable_return_routed_experts = True
 
-    _post_init._prime_rl_allows_nixl_routed_experts = True
+    _post_init._prime_rl_allows_routed_experts_with_kv_connectors = True
     VllmConfig.__post_init__ = _post_init
-    logger.warning("Enabled vLLM routed-experts capture with NIXL connector patch.")
+    logger.info("Allowed vLLM routed-experts capture with KV connectors %s.", sorted(ROUTED_EXPERTS_KV_CONNECTORS))
+
+
+def _is_pd_decode_request(request) -> bool:
+    params = request.kv_transfer_params or {}
+    return bool(params.get("remote_engine_id")) and not params.get("do_remote_decode")
+
+
+def _routed_experts_load_limit(request, num_computed_tokens: int, block_size: int) -> int | None:
+    """How many tokens past ``num_computed_tokens`` an external KV load may cover under routed-expert capture.
+
+    A load fills fresh blocks whose routing slots still hold rows of the block's previous owner.
+    vLLM returns routing only from ``routed_experts_prompt_start`` on (the client already holds the
+    rows before it), so loads that stop at that block boundary stay exact. Decode-side P/D requests
+    are not bounded: the router replaces their prompt rows with the prefill instance's rows, and
+    rows after the prompt come from each step's forward pass, never from the slots.
+    """
+    if _is_pd_decode_request(request):
+        return None
+    prompt_start = request.sampling_params.routed_experts_prompt_start
+    return max(0, prompt_start // block_size * block_size - num_computed_tokens)
+
+
+def monkey_patch_clamp_kv_offload_loads_for_routed_experts():
+    """Clamp native (``OffloadingConnector``) and Mooncake KV offload loads with `_routed_experts_load_limit`.
+
+    Needed because vLLM keys routed experts by physical KV slot and no connector moves routing with
+    the KV. Multi-turn reloads stay below the next turn's ``routed_experts_prompt_start`` and keep
+    their hits; offloaded prefixes past it (first turns, shared prompts) are recomputed.
+    """
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.connector import MooncakeStoreConnector
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import OffloadingConnector
+
+    if getattr(OffloadingConnector._max_loadable_tokens, "_prime_rl_routed_experts_clamp", False):
+        return
+
+    original_max_loadable_tokens = OffloadingConnector._max_loadable_tokens
+    original_get_num_new_matched_tokens = MooncakeStoreConnector.get_num_new_matched_tokens
+
+    def _max_loadable_tokens(self, request, num_computed_tokens):
+        bound = original_max_loadable_tokens(self, request, num_computed_tokens)
+        if not self._vllm_config.model_config.enable_return_routed_experts:
+            return bound
+        limit = _routed_experts_load_limit(request, num_computed_tokens, self._vllm_config.cache_config.block_size)
+        if limit is None:
+            return bound
+        return limit if bound is None else min(bound, limit)
+
+    def _get_num_new_matched_tokens(self, request, num_computed_tokens):
+        num_tokens, load_async = original_get_num_new_matched_tokens(self, request, num_computed_tokens)
+        if not num_tokens or not self._vllm_config.model_config.enable_return_routed_experts:
+            return num_tokens, load_async
+        scheduler = self.connector_scheduler
+        limit = _routed_experts_load_limit(request, num_computed_tokens, scheduler._block_size)
+        if limit is None or num_tokens <= limit:
+            return num_tokens, load_async
+        if limit == 0:
+            del scheduler.load_specs[request.request_id]
+            return 0, False
+        # The new end is a full block inside the hit, stored under its own hash, so the tail-key
+        # overrides for the old (possibly partial) end no longer apply.
+        load_spec = scheduler.load_specs[request.request_id]
+        load_spec.kvpool_cached_tokens = num_computed_tokens + limit
+        load_spec.tail_key_boundaries = ()
+        return limit, load_async
+
+    _max_loadable_tokens._prime_rl_routed_experts_clamp = True
+    OffloadingConnector._max_loadable_tokens = _max_loadable_tokens
+    MooncakeStoreConnector.get_num_new_matched_tokens = _get_num_new_matched_tokens
+
+
+def _track_externally_loaded_blocks(kv_cache_manager, gid: int, block_size: int) -> set[int]:
+    """Live set of block ids (in KV cache group ``gid``) filled by an external KV load since their last allocation.
+
+    Such blocks enter the GPU prefix cache, but their routing slots were never written by a forward pass.
+    """
+    from vllm.utils.math_utils import cdiv
+
+    stale: set[int] = set()
+    block_pool = kv_cache_manager.block_pool
+    get_new_blocks = block_pool.get_new_blocks
+    allocate_slots = kv_cache_manager.allocate_slots
+
+    def _get_new_blocks(num_blocks):
+        blocks = get_new_blocks(num_blocks)
+        stale.difference_update(block.block_id for block in blocks)
+        return blocks
+
+    def _allocate_slots(request, num_new_tokens, *args, **kwargs):
+        blocks = allocate_slots(request, num_new_tokens, *args, **kwargs)
+        num_external = kwargs.get("num_external_computed_tokens", 0)
+        if blocks is not None and num_external:
+            start = request.num_computed_tokens + kwargs.get("num_new_computed_tokens", 0)
+            block_ids = kv_cache_manager.get_block_ids(request.request_id)[gid]
+            stale.update(block_ids[start // block_size : cdiv(start + num_external, block_size)])
+        return blocks
+
+    block_pool.get_new_blocks = _get_new_blocks
+    kv_cache_manager.allocate_slots = _allocate_slots
+    return stale
+
+
+def _first_stale_block(block_ids: list[int], stale: set[int], prompt_start: int, block_size: int) -> int | None:
+    """Index of the first block in ``block_ids`` holding rows from ``prompt_start`` on whose slots are stale."""
+    return next((i for i in range(prompt_start // block_size, len(block_ids)) if block_ids[i] in stale), None)
+
+
+def monkey_patch_routed_experts_cut_stale_prefix_hits():
+    """Cut local prefix-cache hits at externally loaded blocks that a request needs routing rows from.
+
+    The load clamp keeps the loading request exact, but the loaded blocks then serve local prefix hits,
+    and a later request with a lower ``routed_experts_prompt_start`` would read the stale slots under
+    them. Such hits are cut at the first stale block, so the rest is recomputed. Requests with output
+    (resumed after preemption) and decode-side P/D requests read no prompt rows from the slots.
+    Obsolete with vllm#45635 (routing keyed by block hash): delete at the next vLLM bump.
+    """
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    if getattr(Scheduler._get_local_prefix_cache_hit, "_prime_rl_routed_experts_cut", False):
+        return
+
+    original_init = Scheduler.__init__
+    original_get_local_prefix_cache_hit = Scheduler._get_local_prefix_cache_hit
+
+    def __init__(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        self._prime_rl_routing_stale_blocks = None
+        if self.enable_return_routed_experts and self.connector is not None:
+            mgr = self.routed_experts_mgr
+            self._prime_rl_routing_stale_blocks = _track_externally_loaded_blocks(
+                self.kv_cache_manager, mgr.attn_gid, mgr.block_size
+            )
+
+    def _get_local_prefix_cache_hit(self, request):
+        hit = original_get_local_prefix_cache_hit(self, request)
+        stale = self._prime_rl_routing_stale_blocks
+        if not stale or request.num_output_tokens or _is_pd_decode_request(request):
+            return hit
+        mgr = self.routed_experts_mgr
+        start = request.sampling_params.routed_experts_prompt_start
+        cut = _first_stale_block(hit[0].get_block_ids()[mgr.attn_gid], stale, start, mgr.block_size)
+        if cut is None:
+            return hit
+        # Redo the lookup capped at the cut, so every KV cache group (e.g. Mamba) agrees on the hit.
+        kv_cache_manager = self.kv_cache_manager
+        keep = cut * mgr.block_size // self.block_size * self.block_size
+        blocks, num_local, num_uncached = kv_cache_manager.coordinator.find_longest_cache_hit(
+            request.block_hashes, keep
+        )
+        boundary = num_local + num_uncached if num_uncached else 0
+        return kv_cache_manager.create_kv_cache_blocks(blocks), num_local, boundary, False
+
+    _get_local_prefix_cache_hit._prime_rl_routed_experts_cut = True
+    Scheduler.__init__ = __init__
+    Scheduler._get_local_prefix_cache_hit = _get_local_prefix_cache_hit
 
 
 def monkey_patch_strip_routed_experts_from_chat():
