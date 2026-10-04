@@ -54,13 +54,6 @@ def _prune_zero_advantages(sample: TrainingSample) -> bool:
     return has_rl or has_ce or has_ref_kl
 
 
-def _prune_selected(selected: list[tuple[str, list[TrainingSample]]]) -> dict[str, list[TrainingSample]]:
-    pruned = {
-        trace_id: [sample for sample in samples if _prune_zero_advantages(sample)] for trace_id, samples in selected
-    }
-    return {trace_id: samples for trace_id, samples in pruned.items() if samples}
-
-
 class TrainSink:
     """Score native episodes, admit groups, then compile trainer payloads."""
 
@@ -337,7 +330,14 @@ class TrainSink:
             del self.pending_batch[trace_id]
 
         if not self.config.constant_trainer_batch_size:
-            selected_by_trace = await asyncio.to_thread(_prune_selected, selected)
+            def prune_selected() -> dict[str, list[TrainingSample]]:
+                pruned = {
+                    trace_id: [sample for sample in samples if _prune_zero_advantages(sample)]
+                    for trace_id, samples in selected
+                }
+                return {trace_id: samples for trace_id, samples in pruned.items() if samples}
+
+            selected_by_trace = await asyncio.to_thread(prune_selected)
         samples = [sample for trace_samples in selected_by_trace.values() for sample in trace_samples]
 
         shipped_ids = set(selected_by_trace)
