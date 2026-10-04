@@ -21,6 +21,7 @@ from prime_rl.utils.pathing import (
     get_ckpt_dir,
     get_launcher_dir,
     get_launcher_log_dir,
+    get_trainer_step_path,
     prepare_attempt_dirs,
     resolve_latest_ckpt_step,
     validate_run_dir,
@@ -329,6 +330,7 @@ def write_slurm_script(config: RLConfig, config_dir: Path, log_dir: Path, script
             log_dir=log_dir,
             output_dir=config.run_dir,
             launcher_dir=get_launcher_dir(config.run_dir),
+            trainer_step_path=get_trainer_step_path(config.run_dir),
             launcher_log_dir=get_launcher_log_dir(config.run_dir),
             gpus_per_node=config.deployment.gpus_per_node,
         )
@@ -343,6 +345,7 @@ def write_slurm_script(config: RLConfig, config_dir: Path, log_dir: Path, script
             log_dir=log_dir,
             output_dir=config.run_dir,
             launcher_dir=get_launcher_dir(config.run_dir),
+            trainer_step_path=get_trainer_step_path(config.run_dir),
             launcher_log_dir=get_launcher_log_dir(config.run_dir),
             num_train_nodes=config.deployment.num_train_nodes,
             num_infer_nodes=infer_deploy.num_nodes * config.deployment.num_infer_replicas,
@@ -388,6 +391,7 @@ def write_slurm_script(config: RLConfig, config_dir: Path, log_dir: Path, script
             log_dir=log_dir,
             output_dir=config.run_dir,
             launcher_dir=get_launcher_dir(config.run_dir),
+            trainer_step_path=get_trainer_step_path(config.run_dir),
             launcher_log_dir=get_launcher_log_dir(config.run_dir),
             num_train_nodes=config.deployment.num_train_nodes,
             num_infer_nodes=config.deployment.total_infer_nodes,
@@ -520,7 +524,7 @@ def rl(config: RLConfig):
             resume_step = config.resume.step
             if resume_step is None:
                 ckpt_base = ckpt_output_dir if ckpt_output_dir is not None else config.run_dir
-                resume_step = resolve_latest_ckpt_step(get_ckpt_dir(ckpt_base))
+                resume_step = resolve_latest_ckpt_step(get_ckpt_dir(ckpt_base), ("trainer", "orchestrator"))
 
     if resume_step is not None:
         get_logger().info(f"Resuming from step {resume_step}, cleaning future rollouts and broadcasts")

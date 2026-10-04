@@ -298,17 +298,35 @@ def get_all_ckpt_steps(ckpt_dir: Path) -> list[int]:
     return sorted([int(step_dir.name.split("_")[-1]) for step_dir in step_dirs])
 
 
-def resolve_latest_ckpt_step(ckpt_dir: Path) -> int | None:
-    """Gets the latest checkpoint step from the checkpoint directory. Returns None if no checkpoints are found."""
-    steps = get_all_ckpt_steps(ckpt_dir)
-    if len(steps) == 0:
-        logger = get_logger()
-        logger.warning(f"No checkpoints found in {ckpt_dir}. Starting from scratch.")
-        return None
-    latest_step = steps[-1]
+# The file each component writes last when it saves a checkpoint step.
+CKPT_COMPLETE_MARKERS = {"trainer": ".metadata", "orchestrator": "progress.pt"}
+
+
+def resolve_latest_ckpt_step(ckpt_dir: Path, components: tuple[str, ...]) -> int | None:
+    """Gets the latest checkpoint step that every component in ``components`` finished
+    saving. Steps without a complete checkpoint of each component (a save killed
+    mid-write, or the orchestrator checkpoint of a step the trainer never reached) are
+    skipped. Returns None if no complete checkpoint is found."""
     logger = get_logger()
-    logger.info(f"Found latest checkpoint in {ckpt_dir}: {latest_step}")
-    return latest_step
+    steps = [
+        step
+        for step in get_all_ckpt_steps(ckpt_dir)
+        if all(
+            (get_step_path(ckpt_dir, step) / component / CKPT_COMPLETE_MARKERS[component]).exists()
+            for component in components
+        )
+    ]
+    if len(steps) == 0:
+        logger.warning(f"No complete checkpoints found in {ckpt_dir}. Starting from scratch.")
+        return None
+    logger.info(f"Found latest complete checkpoint in {ckpt_dir}: {steps[-1]}")
+    return steps[-1]
+
+
+def get_trainer_step_path(output_dir: Path) -> Path:
+    """The trainer master writes its last finished step here; the SLURM step watchdog
+    reads its mtime."""
+    return output_dir / "trainer_step"
 
 
 def has_checkpoints(output_dir: Path) -> bool:

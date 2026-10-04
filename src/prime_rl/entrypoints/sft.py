@@ -21,6 +21,7 @@ from prime_rl.utils.pathing import (
     get_ckpt_dir,
     get_launcher_dir,
     get_launcher_log_dir,
+    get_trainer_step_path,
     prepare_attempt_dirs,
     resolve_latest_ckpt_step,
     validate_run_dir,
@@ -66,7 +67,7 @@ def resolve_resume_step(config: SFTConfig) -> int | None:
         return config.resume.dir_step
     if config.resume.step is not None:
         return config.resume.step
-    return resolve_latest_ckpt_step(get_ckpt_dir(get_ckpt_base(config)))
+    return resolve_latest_ckpt_step(get_ckpt_dir(get_ckpt_base(config)), ("trainer",))
 
 
 def build_online_eval_monitors(monitors: TrainMonitorsConfig) -> EvalMonitorsConfig:
@@ -178,6 +179,7 @@ def write_slurm_script(
             log_dir=log_dir,
             output_dir=config.run_dir,
             launcher_dir=get_launcher_dir(config.run_dir),
+            trainer_step_path=get_trainer_step_path(config.run_dir),
             launcher_log_dir=get_launcher_log_dir(config.run_dir),
             gpus_per_node=config.deployment.gpus_per_node,
         )
@@ -214,6 +216,7 @@ def write_slurm_script(
             log_dir=log_dir,
             output_dir=config.run_dir,
             launcher_dir=get_launcher_dir(config.run_dir),
+            trainer_step_path=get_trainer_step_path(config.run_dir),
             launcher_log_dir=get_launcher_log_dir(config.run_dir),
             trainer_env_vars=trainer_env_vars,
             num_nodes=config.deployment.num_train_nodes,
