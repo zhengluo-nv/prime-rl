@@ -33,6 +33,7 @@ from prime_rl.utils.process import (
     DEFAULT_TRAINER_ENV_VARS,
     ProcessGroup,
     partition_gpus,
+    set_node_local_triton_cache,
     set_proc_title,
     torchrun_cmd,
 )
@@ -302,6 +303,7 @@ def sft_slurm(config: SFTConfig):
 def sft_local(config: SFTConfig):
     """Run SFT training locally with process monitoring and cleanup."""
     assert config.deployment.type == "single_node"
+    set_node_local_triton_cache()
 
     logger = setup_logger(config.log.level or "info", json_logging=config.log.json_logging)
 

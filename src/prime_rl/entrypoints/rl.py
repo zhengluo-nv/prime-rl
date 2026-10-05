@@ -33,6 +33,7 @@ from prime_rl.utils.process import (
     DEFAULT_TRAINER_ENV_VARS,
     ProcessGroup,
     partition_gpus,
+    set_node_local_triton_cache,
     set_proc_title,
     torchrun_cmd,
 )
@@ -110,6 +111,7 @@ def write_subconfigs(config: RLConfig, output_dir: Path) -> None:
 
 def rl_local(config: RLConfig):
     assert config.deployment.type == "single_node"
+    set_node_local_triton_cache()
 
     logger = setup_logger(
         config.log.level or os.environ.get("PRIME_LOG_LEVEL", "info"),

@@ -63,6 +63,8 @@ ln -sfn inference/node_0.log $LOG_DIR/inference.log
 # Setup environment
 cd $PROJECT_DIR
 [ -f .env ] && source .env
+# Keep the Triton cache node-local: processes sharing ~/.triton on a shared FS hang or crash.
+export TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-/tmp/triton-$SLURM_JOB_ID}
 source .venv/bin/activate
 {% if not shared_fs %}
 # Node-local venv (e.g. UV_PROJECT_ENVIRONMENT on /tmp): a bare `uv sync` would only

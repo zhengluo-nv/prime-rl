@@ -36,6 +36,11 @@ DEFAULT_INFERENCE_ENV_VARS: dict[str, str] = {
 }
 
 
+def set_node_local_triton_cache() -> None:
+    """Processes sharing ~/.triton on a shared FS hang or crash, so default to a node-local cache."""
+    os.environ.setdefault("TRITON_CACHE_DIR", f"/tmp/triton-{os.environ.get('SLURM_JOB_ID') or os.getuid()}")
+
+
 def get_physical_gpu_ids() -> list[int]:
     """Return physical GPU IDs visible to the launcher."""
     raw_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
