@@ -1,6 +1,5 @@
 import asyncio
 import ctypes
-import gc
 import logging
 import math
 from concurrent.futures import ThreadPoolExecutor
@@ -96,7 +95,6 @@ def release_and_trim(*containers: list) -> None:
 
 def trim_process_memory() -> None:
     """Return freed heap pages to the OS on glibc systems."""
-    gc.collect()
     try:
         ctypes.CDLL("libc.so.6").malloc_trim(0)
     except Exception as exc:
